@@ -23,7 +23,7 @@ func errorMessage(raw []byte, fallback string) string {
 func writeOpenAIError(w http.ResponseWriter, status int, typ, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": sanitizePublicInternalText(msg), "type": typ, "code": typ, "param": nil}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": sanitizePublicInternalText(msg), "type": typ}})
 }
 func writeResponsesError(w http.ResponseWriter, status int, typ, msg string) {
 	writeOpenAIError(w, status, typ, msg)

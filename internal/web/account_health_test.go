@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -25,7 +24,7 @@ func TestUpstreamErrorClassification(t *testing.T) {
 		status   int
 	}{
 		{&UpstreamHTTPError{Status: 429, RetryAfter: 90}, true, false, 90, http.StatusTooManyRequests},
-		{&UpstreamHTTPError{Status: 503}, true, false, 0, http.StatusTooManyRequests},
+		{&UpstreamHTTPError{Status: 503}, false, false, 0, http.StatusBadGateway},
 		{&UpstreamHTTPError{Status: 401}, false, true, 0, http.StatusUnauthorized},
 		{&UpstreamHTTPError{Status: 403}, false, true, 0, http.StatusUnauthorized},
 		{&UpstreamHTTPError{Status: 502}, false, false, 0, http.StatusBadGateway},
@@ -157,6 +156,41 @@ func testAccountFiles(t *testing.T) *auth.Store {
 		}
 	}
 	return store
+}
+
+func TestBatchAccountsAppliesAtomically(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+	do := func(body string) (int, map[string]any) {
+		w := httptest.NewRecorder()
+		s.batchAccounts(w, httptest.NewRequest(http.MethodPost, "/api/accounts/batch", strings.NewReader(body)))
+		var out map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+		return w.Code, out
+	}
+	if code, _ := do(`{"ids":[],"scheduling":false}`); code != 400 {
+		t.Fatalf("empty ids status=%d want 400", code)
+	}
+	if code, _ := do(`{"ids":["u-1","missing"],"scheduling":false}`); code != 400 {
+		t.Fatalf("unknown id status=%d want 400", code)
+	}
+	if acc, _ := store.Get("u-1"); !store.ScheduleEnabled("u-1") || acc.WebSearchDisabled {
+		t.Fatal("failed batch must not partially apply")
+	}
+	sp := "Be concise."
+	code, out := do(`{"ids":["u-1","u-2"],"scheduling":false,"webSearch":false,"systemPrompt":"Be concise."}`)
+	if code != 200 || out["updated"] != float64(2) {
+		t.Fatalf("batch status=%d out=%v", code, out)
+	}
+	for _, id := range []string{"u-1", "u-2"} {
+		acc, _ := store.Get(id)
+		if store.ScheduleEnabled(id) || !acc.WebSearchDisabled || acc.SystemPrompt != sp {
+			t.Fatalf("batch not applied to %s: %+v", id, acc)
+		}
+	}
+	if acc, _ := store.Get("u-3"); !store.ScheduleEnabled(acc.ID) || acc.WebSearchDisabled || acc.SystemPrompt != "" {
+		t.Fatal("untouched account must keep defaults")
+	}
 }
 
 func TestWriteUpstreamErrorHeaders(t *testing.T) {
@@ -330,100 +364,5 @@ func TestErrRateLimitNoticeTriggersMarkFailure(t *testing.T) {
 	h.MarkFailure(id, chathub.ErrRateLimitNotice, 15*time.Minute)
 	if h.Available(id) {
 		t.Fatal("ErrRateLimitNotice must put account in cooldown")
-	}
-}
-
-func TestGlobalCircuitOnlyRecordsInfrastructureFailures(t *testing.T) {
-	nonGlobal := []error{
-		&UpstreamHTTPError{Status: 401},
-		&UpstreamHTTPError{Status: 403},
-		&UpstreamHTTPError{Status: 429},
-		&UpstreamHTTPError{Status: 422},
-		&UpstreamHTTPError{ErrorCode: "ErrorUserBanned"},
-		&UpstreamHTTPError{ErrorCode: "InsufficientTokens"},
-		chathub.ErrEmptyCompletion,
-		chathub.ErrOffensiveContent,
-		chathub.ErrImageLimit,
-		context.Canceled,
-	}
-	for _, err := range nonGlobal {
-		ResetGlobalCircuit()
-		for i := 0; i < 10; i++ {
-			GlobalCircuitRecord(err)
-		}
-		if GlobalCircuitIsOpen() {
-			t.Fatalf("non-global error opened circuit: %v", err)
-		}
-	}
-
-	ResetGlobalCircuit()
-	for i := 0; i < 10; i++ {
-		GlobalCircuitRecord(fmt.Errorf("connection refused"))
-	}
-	if !GlobalCircuitIsOpen() {
-		t.Fatal("transport failures must open global circuit")
-	}
-	ResetGlobalCircuit()
-}
-
-func TestParseMeteringAggregatesDeniedItemsRegardlessOfOrder(t *testing.T) {
-	cases := []string{
-		`[{"meterError":"denied","hasAccess":false},{"hasAccess":true}]`,
-		`[{"hasAccess":true},{"meterError":"denied","hasAccess":false}]`,
-	}
-	for _, raw := range cases {
-		meterError, hasAccess := ParseMetering("account", json.RawMessage(raw))
-		if hasAccess || meterError != "denied" {
-			t.Fatalf("ParseMetering(%s) = (%q, %v)", raw, meterError, hasAccess)
-		}
-	}
-}
-
-func TestAccountHealthMeteringDefaultsDeepCopySnapshotAndReset(t *testing.T) {
-	h := newAccountHealth()
-	const id = "acct-metering"
-
-	if _, hasAccess, _ := h.GetMetering(id); !hasAccess {
-		t.Fatal("missing metering state must default hasAccess to true")
-	}
-
-	throttling := map[string]any{
-		"numUserMessagesInConversation":    float64(3),
-		"maxNumUserMessagesInConversation": float64(30),
-		"nested":                           map[string]any{"value": "original"},
-	}
-	remaining := map[string]int{"Chat": 17}
-	h.UpdateThrottling(id, throttling)
-	h.UpdateMetering(id, "meter-error", false, remaining)
-
-	throttling["nested"].(map[string]any)["value"] = "mutated"
-	remaining["Chat"] = 0
-
-	stored := h.GetThrottling(id).(map[string]any)
-	if stored["nested"].(map[string]any)["value"] != "original" {
-		t.Fatal("UpdateThrottling must deep-copy input")
-	}
-	meterError, hasAccess, gotRemaining := h.GetMetering(id)
-	if meterError != "meter-error" || hasAccess || gotRemaining["Chat"] != 17 {
-		t.Fatalf("unexpected metering state: error=%q access=%v remaining=%v", meterError, hasAccess, gotRemaining)
-	}
-
-	snapshot := h.Snapshot()
-	snapshot[id]["throttling"].(map[string]any)["nested"].(map[string]any)["value"] = "snapshot-mutated"
-	snapshot[id]["remainingAllowance"].(map[string]int)["Chat"] = 1
-	if h.GetThrottling(id).(map[string]any)["nested"].(map[string]any)["value"] != "original" {
-		t.Fatal("Snapshot must deep-copy throttling")
-	}
-	_, _, gotRemaining = h.GetMetering(id)
-	if gotRemaining["Chat"] != 17 {
-		t.Fatal("Snapshot must deep-copy remaining allowance")
-	}
-
-	h.ClearAllCooldowns()
-	if got := h.Snapshot(); len(got) != 0 {
-		t.Fatalf("reset left health state: %#v", got)
-	}
-	if meterError, hasAccess, remaining := h.GetMetering(id); meterError != "" || !hasAccess || len(remaining) != 0 {
-		t.Fatalf("reset left metering state: error=%q access=%v remaining=%v", meterError, hasAccess, remaining)
 	}
 }

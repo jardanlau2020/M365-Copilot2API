@@ -26,6 +26,11 @@ type contextAtom struct {
 }
 
 func estimateBudgetTokens(text string) int {
+	if enc, err := getGPTTokenizer(); err == nil {
+		if ids, _, e := enc.Encode(text); e == nil {
+			return len(ids)
+		}
+	}
 	return heuristicTokenCount(text)
 }
 
@@ -47,21 +52,13 @@ func estimateMessageTokens(m oaiMsg, counter func(string) int) int {
 	return tokens
 }
 
-func buildAtomsFast(messages []oaiMsg) []contextAtom {
-	return buildAtomsWithCounter(messages, heuristicTokenCount)
-}
-
 func buildAtoms(messages []oaiMsg) []contextAtom {
-	counter, _ := tokenEstimator("gpt-4")
-	if counter == nil {
-		counter = heuristicTokenCount
-	}
-	return buildAtomsWithCounter(messages, counter)
-}
-
-func buildAtomsWithCounter(messages []oaiMsg, counter func(string) int) []contextAtom {
 	if len(messages) == 0 {
 		return nil
+	}
+	counter, _ := tokenEstimator("gpt-4")
+	if counter == nil {
+		counter = estimateBudgetTokens
 	}
 	var atoms []contextAtom
 	i := 0
@@ -155,7 +152,7 @@ func slidingWindow(messages []oaiMsg, budget int) ([]oaiMsg, bool, error) {
 	if budget <= 0 {
 		budget = 1024
 	}
-	atoms := buildAtomsFast(messages)
+	atoms := buildAtoms(messages)
 	if len(atoms) == 0 {
 		return messages, false, nil
 	}

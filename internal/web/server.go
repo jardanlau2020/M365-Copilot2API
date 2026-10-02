@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -93,26 +94,6 @@ func (s *Server) markAccountResult(accountID string, err error) {
 	s.accountPool.MarkSuccess(accountID)
 }
 
-func (s *Server) recordAccountChatResult(accountID string, result chathub.Result, err error) {
-	s.markAccountResult(accountID, err)
-	if err != nil || s == nil || s.accountPool == nil || accountID == "" {
-		return
-	}
-	if result.Throttling != nil {
-		s.accountPool.UpdateThrottling(accountID, result.Throttling)
-		s.logThrottlingWarning(accountID, result.Throttling)
-	}
-	meterError := ""
-	hasAccess := true
-	if result.MeteringInformation != nil {
-		if raw, marshalErr := json.Marshal(result.MeteringInformation); marshalErr == nil {
-			meterError, hasAccess = ParseMetering(accountID, json.RawMessage(raw))
-			applyMeteringCooldown(s.accountPool, accountID, meterError)
-		}
-	}
-	s.accountPool.UpdateMetering(accountID, meterError, hasAccess, remainingAllowances(result.Throttling))
-}
-
 // confirmRateLimitNotice verifies a text-channel rate-limit notice with a
 // separate, fresh ChatHub conversation. A single notice is not enough to cool
 // down an account because the upstream can occasionally emit a false positive.
@@ -175,6 +156,7 @@ type Server struct {
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
 	lastHealthyAccount   string
+	contextAffinity      *contextAffinity
 }
 
 const maxResponsesPerTenant = 256
@@ -195,10 +177,11 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 		HTTPHeader: make(http.Header),
 		HTTPClient: clients.HTTP,
 		Dialer:     clients.WebSocket,
+		Pool:       chathub.NewConnPool(clients.WebSocket, make(http.Header)),
 		Trace:      s.chat.Trace,
 	}
 	c.HTTPHeader.Set("Origin", "https://m365.cloud.microsoft")
-	c.HTTPHeader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
+	c.HTTPHeader.Set("User-Agent", chromeUA)
 	actual, _ := s.proxyClients.LoadOrStore(proxyURL, c)
 	return actual.(*chathub.Client)
 }
@@ -270,6 +253,7 @@ func New() (*Server, error) {
 		usage:                openUsageLog(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
+		contextAffinity:      newContextAffinity(),
 	}, nil
 }
 
@@ -296,8 +280,14 @@ func (s *Server) PreheatPool() {
 		if acc.OID == "" {
 			continue
 		}
+		// Warm through the account's own client so a proxy-bound account warms
+		// its proxy pool instead of leaking a direct connection past the proxy.
+		client := s.accountClient(acc.ID)
+		if client == nil || client.Pool == nil {
+			continue
+		}
 		for i := 0; i < 2; i++ {
-			go func(a auth.AccountToken) {
+			go func(a auth.AccountToken, cl *chathub.Client) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
 				reqID := uuid.NewString()
@@ -307,8 +297,8 @@ func (s *Server) PreheatPool() {
 				if err != nil {
 					return
 				}
-				s.chat.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
-			}(acc)
+				cl.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
+			}(acc, client)
 		}
 	}
 }
@@ -328,6 +318,102 @@ func (s *Server) InitM365CloudClient() {
 	}
 	InitM365CloudClient(clientID, acc.TID, acc.RefreshToken)
 	log.Printf("[m365-cloud] client initialized for account %s", acc.Email)
+}
+
+// keepPoolWarm re-warms the active account plus one standby so a new request
+// reuses a pooled socket instead of paying the ~0.7s dial. Pooled sockets have
+// a 2-minute TTL, so this runs well inside that window.
+func (s *Server) keepPoolWarm() {
+	if s.chat == nil || s.chat.Pool == nil {
+		return
+	}
+	s.mu.Lock()
+	active := s.lastHealthyAccount
+	s.mu.Unlock()
+	accounts := s.tokens.List()
+	if len(accounts) == 0 {
+		return
+	}
+	targets := make([]auth.AccountToken, 0, 2)
+	seen := map[string]bool{}
+	add := func(a auth.AccountToken) {
+		if a.ID == "" || seen[a.ID] {
+			return
+		}
+		if a.OID == "" || a.TID == "" {
+			oid, tid := extractOIDTID(a.AccessToken)
+			a.OID, a.TID = oid, tid
+		}
+		if a.OID == "" || a.TID == "" {
+			return
+		}
+		seen[a.ID] = true
+		targets = append(targets, a)
+	}
+	if acc, ok := s.tokens.Get(active); ok && s.accountAvailable(acc.ID) {
+		add(acc)
+	}
+	for _, a := range accounts {
+		if len(targets) >= 2 {
+			break
+		}
+		if a.ID != active && s.accountAvailable(a.ID) {
+			add(a)
+		}
+	}
+	if len(targets) == 0 {
+		for _, a := range accounts {
+			if s.accountAvailable(a.ID) {
+				add(a)
+			}
+			if len(targets) >= 2 {
+				break
+			}
+		}
+	}
+	cfg := s.settings.get()
+	now := time.Now()
+	for _, acc := range targets {
+		// Warm through the account's own client so a proxy-bound account warms
+		// the correct pool instead of leaking a direct connection past its proxy.
+		client := s.accountClient(acc.ID)
+		if client == nil || client.Pool == nil {
+			continue
+		}
+		// Skip accounts whose token is already expired; dialing would just fail.
+		if !acc.ExpiresAt.IsZero() && acc.ExpiresAt.Before(now) {
+			continue
+		}
+		for i := 0; i < 2; i++ {
+			go func(a auth.AccountToken, cl *chathub.Client) {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				wsURL, err := chathub.BuildWSURL(chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, uuid.NewString(), uuid.NewString(), uuid.NewString(), cfg.LicenseType, cfg.Scenario)
+				if err != nil {
+					return
+				}
+				cl.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
+			}(acc, client)
+		}
+	}
+}
+
+// StartPoolKeeper keeps a small set of pooled WebSocket connections warm so the
+// first request of a session does not pay a fresh dial. It stops when ctx is
+// cancelled during shutdown.
+func (s *Server) StartPoolKeeper(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(90 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.keepPoolWarm()
+			}
+		}
+	}()
 }
 
 func (s *Server) RefreshExpiredTokens() {
@@ -365,6 +451,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
 	m.HandleFunc("/api/accounts/schedule", s.scheduleAccount)
+	m.HandleFunc("/api/accounts/batch", s.batchAccounts)
 	m.HandleFunc("/api/accounts/token-health", s.tokenHealth)
 	m.HandleFunc("/api/accounts/clear-cooldown", s.clearCooldown)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
@@ -404,6 +491,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/memory/instructions", s.handleMemoryInstructions)
 	m.HandleFunc("/v1/memory/instructions/", s.handleMemoryInstructionsID)
 	m.HandleFunc("/v1/memory/settings", s.handleMemorySettings)
+	// React SPA bundle (Vite output lives under web/webapp inside the embed).
+	m.HandleFunc("/webapp/", s.serveWebApp)
 	m.HandleFunc("/", s.rootPage)
 	return recoverPanics(requestID(httpTrace(securityHeaders(s.adminMiddleware(s.debugMiddleware(m))))))
 }
@@ -411,6 +500,12 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/images/files/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The SPA shell and its hashed assets are public: authentication is
+		// enforced by the app itself against the admin session APIs.
+		if strings.HasPrefix(r.URL.Path, "/webapp/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -502,7 +597,6 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Password string `json:"password"`
-		Remember bool   `json:"remember"`
 	}
 	decodeErr := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body)
 	s.mu.Lock()
@@ -536,15 +630,9 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(s.adminSessions, oldest)
 	}
-	ttl := 24 * time.Hour
-	maxAge := 86400
-	if body.Remember {
-		ttl = 30 * 24 * time.Hour
-		maxAge = 30 * 86400
-	}
-	s.adminSessions[token] = now.Add(ttl)
+	s.adminSessions[token] = now.Add(24 * time.Hour)
 	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Value: token, Path: "/", HttpOnly: true, Secure: secureAdminCookie(r), SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
+	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Value: token, Path: "/", HttpOnly: true, Secure: secureAdminCookie(r), SameSite: http.SameSiteLaxMode, MaxAge: 86400})
 	jsonOut(w, map[string]any{"status": "authenticated", "must_change_password": mustChange})
 }
 func (s *Server) adminLogout(w http.ResponseWriter, r *http.Request) {
@@ -679,27 +767,26 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	list := s.tokens.List()
 	type view struct {
-		ID                 string         `json:"id"`
-		Email              string         `json:"email"`
-		DisplayName        string         `json:"displayName,omitempty"`
-		Status             string         `json:"status"`
-		ScheduleEnabled    bool           `json:"scheduleEnabled"`
-		CallCount          uint64         `json:"callCount"`
-		RateLimited        bool           `json:"rateLimited"`
-		ImageLimited       bool           `json:"imageLimited"`
-		AuthFailed         bool           `json:"authFailed"`
-		AuthFailReason     string         `json:"authFailReason,omitempty"`
-		CooldownUntil      *time.Time     `json:"cooldownUntil,omitempty"`
-		Throttling         any            `json:"throttling,omitempty"`
-		MeterError         string         `json:"meterError,omitempty"`
-		MeterHasAccess     bool           `json:"meterHasAccess"`
-		RemainingAllowance map[string]int `json:"remainingAllowance,omitempty"`
-		Concurrency        int            `json:"concurrency"`
-		OID                string         `json:"oid,omitempty"`
-		TID                string         `json:"tid,omitempty"`
-		ExpiresAt          time.Time      `json:"expiresAt,omitempty"`
-		UpdatedAt          time.Time      `json:"updatedAt,omitempty"`
-		BoundProxy         string         `json:"boundProxy,omitempty"`
+		ID               string     `json:"id"`
+		Email            string     `json:"email"`
+		DisplayName      string     `json:"displayName,omitempty"`
+		Status           string     `json:"status"`
+		ScheduleEnabled  bool       `json:"scheduleEnabled"`
+		WebSearchEnabled bool       `json:"webSearchEnabled"`
+		SystemPrompt     string     `json:"systemPrompt,omitempty"`
+		CallCount        uint64     `json:"callCount"`
+		RateLimited      bool       `json:"rateLimited"`
+		ImageLimited     bool       `json:"imageLimited"`
+		AuthFailed       bool       `json:"authFailed"`
+		AuthFailReason   string     `json:"authFailReason,omitempty"`
+		CooldownUntil    *time.Time `json:"cooldownUntil,omitempty"`
+		Throttling       any        `json:"throttling,omitempty"`
+		Concurrency      int        `json:"concurrency"`
+		OID              string     `json:"oid,omitempty"`
+		TID              string     `json:"tid,omitempty"`
+		ExpiresAt        time.Time  `json:"expiresAt,omitempty"`
+		UpdatedAt        time.Time  `json:"updatedAt,omitempty"`
+		BoundProxy       string     `json:"boundProxy,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -708,9 +795,6 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		var callCount uint64
 		var rateLimited bool
 		var throttling any
-		var meterError string
-		var meterHasAccess = true
-		var remainingAllowance map[string]int
 		var authFailReason string
 		var imageLimited bool
 		if s.accountPool != nil {
@@ -721,21 +805,19 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			callCount = s.accountPool.CallCount(a.ID)
 			rateLimited = s.accountPool.RateLimited(a.ID)
 			throttling = s.accountPool.GetThrottling(a.ID)
-			meterError, meterHasAccess, remainingAllowance = s.accountPool.GetMetering(a.ID)
 			authFailReason = s.accountPool.AuthFailReason(a.ID)
 			imageLimited = s.accountPool.ImageLimited(a.ID)
 		}
 		concurrency := s.accountConcurrency.Inflight(a.ID)
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
-			Status: status, ScheduleEnabled: !a.ScheduleDisabled, CallCount: callCount, RateLimited: rateLimited,
+			Status: status, ScheduleEnabled: !a.ScheduleDisabled, WebSearchEnabled: !a.WebSearchDisabled, SystemPrompt: a.SystemPrompt,
+			CallCount: callCount, RateLimited: rateLimited,
 			ImageLimited:   imageLimited,
 			AuthFailed:     s.accountPool != nil && !s.accountPool.Available(a.ID) && authFailReason != "",
 			AuthFailReason: authFailReason,
-			CooldownUntil:  cooldownUntil, Throttling: throttling,
-			MeterError: meterError, MeterHasAccess: meterHasAccess, RemainingAllowance: remainingAllowance,
-			Concurrency: concurrency,
-			OID:         a.OID, TID: a.TID,
+			CooldownUntil:  cooldownUntil, Throttling: throttling, Concurrency: concurrency,
+			OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt, BoundProxy: a.BoundProxy,
 		})
 	}
@@ -783,6 +865,33 @@ func (s *Server) scheduleAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, map[string]any{"status": "updated", "scheduleEnabled": body.Enabled})
+}
+
+func (s *Server) batchAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		return
+	}
+	var body struct {
+		IDs          []string `json:"ids"`
+		Scheduling   *bool    `json:"scheduling"`
+		WebSearch    *bool    `json:"webSearch"`
+		SystemPrompt *string  `json:"systemPrompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "bad json")
+		return
+	}
+	if body.Scheduling == nil && body.WebSearch == nil && body.SystemPrompt == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "nothing to update")
+		return
+	}
+	n, err := s.tokens.SetAccountsBatch(body.IDs, body.Scheduling, body.WebSearch, body.SystemPrompt)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	jsonOut(w, map[string]any{"status": "updated", "updated": n})
 }
 
 func (s *Server) tokenHealth(w http.ResponseWriter, r *http.Request) {
@@ -1060,6 +1169,10 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 	p.Account = map[string]any{"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName, "status": acc.Status, "oid": acc.OID, "tid": acc.TID}
 	s.pkce[state] = p
 	s.mu.Unlock()
+	// Hot-reload the cloud client so conversation management works immediately
+	// after adding the first account at runtime (issue #84); it is otherwise
+	// only initialized at startup.
+	s.InitM365CloudClient()
 	// Browser loopback callbacks should finish in a friendly page instead of
 	// displaying a raw JSON response. Keep JSON for the manual/API flow.
 	if strings.HasPrefix(redirectURI, "http://127.0.0.1:") || strings.HasPrefix(redirectURI, "http://localhost:") {
@@ -1107,6 +1220,12 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			if retry < 5 {
 				retry = 5
 			}
+			// A local network failure is not a quota problem: report 503 with a
+			// distinct error code instead of masquerading as 429 rate limiting
+			// (issue #79).
+			if cat, at := s.accountPool.LastCategory(); time.Since(at) < 5*time.Minute && IsTransportCategory(cat) {
+				return auth.AccountToken{}, &UpstreamHTTPError{Status: 503, ErrorCode: "network_error", RetryAfter: retry, Body: "all accounts cooling down after local network errors (last: " + string(cat) + "); check DNS/IPv6/proxy connectivity"}
+			}
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 		}
 		if !s.accountConcurrency.Available(accountID) {
@@ -1140,6 +1259,78 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 		return s.tokens.EnsureValid(acc.ID)
 	}
 	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
+}
+
+func (s *Server) failoverStats(attempted []string) (total, throttled, healthy, attemptedCount int) {
+	total = len(s.tokens.List())
+	throttled = 0
+	healthy = 0
+	if s.accountPool != nil {
+		for _, a := range s.tokens.List() {
+			if s.accountPool.RateLimited(a.ID) {
+				throttled++
+			} else if s.accountAvailable(a.ID) {
+				healthy++
+			}
+		}
+	} else {
+		healthy = total
+	}
+	attemptedCount = len(attempted)
+	return
+}
+
+func (s *Server) writeFailoverExhausted(w http.ResponseWriter, attempted []string) {
+	total, throttled, healthy, attemptedCount := s.failoverStats(attempted)
+	retry := 30
+	if s.accountPool != nil {
+		if until := s.accountPool.EarliestRecovery(); !until.IsZero() {
+			if r := int(time.Until(until).Seconds()); r > 0 {
+				retry = r
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", fmt.Sprint(retry))
+	w.Header().Set("X-M365-Retry-After", fmt.Sprint(retry))
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":              map[string]any{"message": "所有账号均触发限流，请稍后重试", "type": "rate_limit_error", "code": "rate_limit_exhausted"},
+		"total_accounts":     total,
+		"throttled_accounts": throttled,
+		"healthy_accounts":   healthy,
+		"attempted_accounts": attemptedCount,
+		"failover_status":    "exhausted",
+	})
+}
+
+func (s *Server) nextHealthyExcluding(tried map[string]bool) (auth.AccountToken, bool) {
+	for _, acc := range s.tokens.List() {
+		if tried[acc.ID] {
+			continue
+		}
+		if !s.accountAvailable(acc.ID) {
+			continue
+		}
+		if tok, err := s.tokens.EnsureValid(acc.ID); err == nil {
+			return tok, true
+		}
+	}
+	return auth.AccountToken{}, false
+}
+
+func isThrottledForFailover(err error) bool {
+	if IsRateLimited(err) {
+		return true
+	}
+	// HAR 报告 06/07：WS_READ_TIMEOUT 是账号级读超时，应触发跨账号转移；
+	// 报告 07 实证上游 422 属可重试成员。共享层传输故障（DNS/TCP/TLS/SOCKS5）
+	// 与 503 不在此列，交给全局熔断快速失败，避免逐账号轮转造成集体冷却。
+	switch ClassifyError(err) {
+	case CategoryWSReadTimeout, CategoryRetryable422:
+		return true
+	}
+	return false
 }
 
 type chatBody struct {
@@ -1240,6 +1431,10 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	}
 	acc, err := s.resolveAccount(body.AccountID)
 	if err != nil {
+		if isThrottledForFailover(err) {
+			s.writeFailoverExhausted(w, nil)
+			return
+		}
 		writeUpstreamError(w, err)
 		return
 	}
@@ -1250,7 +1445,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if acc.OID == "" || acc.TID == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "account_error", "account missing oid/tid — re-login with PKCE browser client")
+		writeOpenAIError(w, http.StatusBadRequest, "account_error", "account missing oid/tid")
 		return
 	}
 
@@ -1276,11 +1471,75 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		originalErr := err
-		// Failover: a rate-limited or auth-failed account must not take down the
-		// request when the pool has other healthy accounts. Only auto-selected
-		// requests fail over; an explicitly chosen account is respected, and a
-		// conversation-bound chat stays on its account.
-		if body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "") {
+		if body.AccountID == "" && body.ConversationID == "" && isThrottledForFailover(err) {
+			tried := map[string]bool{acc.ID: true}
+			attempted := []string{acc.ID}
+			s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
+			succeeded := false
+			var lastErr error = originalErr
+			for {
+				next, ok := s.nextHealthyExcluding(tried)
+				if !ok {
+					s.writeFailoverExhausted(w, attempted)
+					return
+				}
+				tried[next.ID] = true
+				attempted = append(attempted, next.ID)
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{
+					Text:                  text,
+					Tone:                  body.Tone,
+					ConversationID:        body.ConversationID,
+					SessionID:             body.SessionID,
+					Attachments:           body.Attachments,
+					LicenseType:           chatSettings.LicenseType,
+					Scenario:              chatSettings.Scenario,
+					ConversationSignature: body.ConversationSignature,
+					PreviousMessages:      body.PreviousMessages,
+					ConnectedFederatedIDs: body.ConnectedFederatedIDs,
+					FeatureFlags:          s.featureFlags(),
+				})
+				cancel2()
+				if err2 == nil {
+					s.accountPool.MarkSuccess(next.ID)
+					acc = next
+					res = res2
+					err = nil
+					succeeded = true
+					break
+				}
+				if isThrottledForFailover(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+					lastErr = err2
+					continue
+				}
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(next.ID)
+				}
+				err = err2
+				acc = next
+				break
+			}
+			if succeeded {
+				// fall through to success path
+			} else if len(attempted) > 1 && isThrottledForFailover(lastErr) && err == nil {
+				// loop exhausted via continue path already returned, but guard
+				s.writeFailoverExhausted(w, attempted)
+				return
+			} else if err != nil {
+				if isThrottledForFailover(err) {
+					s.writeFailoverExhausted(w, attempted)
+					return
+				}
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				writeUpstreamError(w, err)
+				return
+			}
+		} else if IsAuthFailure(err) && body.AccountID == "" && body.ConversationID == "" {
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
@@ -1299,32 +1558,47 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					FeatureFlags:          s.featureFlags(),
 				})
 				if err2 == nil {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkSuccess(next.ID)
 					acc = next
 					res = res2
 					err = nil
 				} else {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
 					err = err2
 				}
 			}
-		}
-		if err != nil {
+			if err != nil {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				writeUpstreamError(w, err)
+				return
+			}
+		} else {
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
+			}
+			if isThrottledForFailover(err) {
+				s.writeFailoverExhausted(w, []string{acc.ID})
+				return
 			}
 			writeUpstreamError(w, err)
 			return
 		}
 	}
-	if res.Throttling != nil && s.accountPool != nil {
-		s.accountPool.UpdateThrottling(acc.ID, res.Throttling)
-		s.logThrottlingWarning(acc.ID, res.Throttling)
-	}
+	s.accountPool.MarkSuccess(acc.ID)
+	s.applyResultMetering(acc.ID, res)
+	// Strip upstream citation control markup from public text (issue #79).
+	res.Text, _ = chathub.StripCitationMarkers(res.Text, res.References)
 	res.Text = sanitizePublicAssistantText(res.Text)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
 	if body.SessionKey != "" {
@@ -1401,14 +1675,14 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		Model     string `json:"model"`
-		AccountID string `json:"account_id"`
+		Model  string `json:"model"`
+		Prompt string `json:"prompt"`
 	}
-	if json.NewDecoder(r.Body).Decode(&b) != nil || strings.TrimSpace(b.Model) == "" {
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&b) != nil || strings.TrimSpace(b.Model) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "bad json: model required")
 		return
 	}
-	acc, err := s.resolveAccount(b.AccountID)
+	acc, err := s.resolveAccount("")
 	if err != nil {
 		writeUpstreamError(w, err)
 		return
@@ -1423,12 +1697,16 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tone, _ := reasoningTone(b.Model, "")
+	prompt := strings.TrimSpace(b.Prompt)
+	if prompt == "" {
+		prompt = `Say "OK" in one word.`
+	}
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
 	testCfg := s.settings.get()
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{
-		Text:         `Say "OK" in one word.`,
+		Text:         prompt,
 		Tone:         tone,
 		LicenseType:  testCfg.LicenseType,
 		Scenario:     testCfg.Scenario,
@@ -1439,6 +1717,9 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "m365_error", upstreamError(err))
 		return
 	}
+	// The probe has no conversation binding, so M365 created a throwaway
+	// conversation; delete it so model tests do not clutter the account.
+	s.dropTransientConversation(res.ConversationID)
 	jsonOut(w, map[string]any{"ok": true, "model": b.Model, "reply": sanitizePublicAssistantTextForModel(res.Text, b.Model), "latency_ms": ms})
 }
 
@@ -1666,6 +1947,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	if body.Reasoning != nil && strings.TrimSpace(body.Reasoning.Effort) != "" {
 		effort = body.Reasoning.Effort
 	}
+	if isImageModel(body.Model) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "image model must use /v1/images/generations, not chat completions")
+		return
+	}
+	if !isKnownPublicModel(body.Model) {
+		if strictModelMode() {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "unknown model: "+body.Model)
+			return
+		}
+		log.Printf("[model] unknown model %q; routing to default tone", body.Model)
+	}
 	tone, toneErr := reasoningTone(body.Model, effort)
 	if toneErr != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", toneErr.Error())
@@ -1752,7 +2044,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[user-session] hit user=%s conversation=%s session=%s", body.User, us.ConversationID, us.SessionID)
 		}
 	}
-	if body.Metadata != nil && body.Metadata.CopilotTempSession {
+	tempSession := body.Metadata != nil && body.Metadata.CopilotTempSession
+	if tempSession {
 		body.ConversationID = ""
 		body.SessionID = ""
 		log.Printf("[temp-session] copilot_temp_session=true, clearing conversation/session for one-shot request")
@@ -1777,10 +2070,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if body.AccountID == "" && s.contextAffinity != nil {
+		if affID, ok := s.contextAffinity.Resolve(s, r, &body); ok && affID != "" {
+			body.AccountID = affID
+			log.Printf("[context-affinity] hit account=%s hash=%s explicit=%q", affID, contextHash(body.Messages), r.Header.Get(sessionHeaderName))
+		}
+	}
 	accountID := body.AccountID
 	acc, err := s.resolveAccount(accountID)
 	if err != nil {
 		log.Printf("[account-route] resolve failed requested=%q err=%v", accountID, err)
+		if isThrottledForFailover(err) {
+			s.writeFailoverExhausted(w, nil)
+			return
+		}
 		writeUpstreamErrorWithAccount(w, err, accountID)
 		return
 	}
@@ -1794,6 +2097,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "account_error", "account missing oid/tid")
 		return
 	}
+	s.healthPing(acc.ID, acc.AccessToken, acc.OID, acc.TID, body.SessionID, requestID)
 
 	// Conversation cache: reuse existing M365 conversation for same account+model
 	// to avoid re-processing full system prompt + history each request (latency
@@ -1821,6 +2125,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if !convReused && body.ConversationID == "" {
 		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
+	}
+
+	// Per-account overrides from the account pool batch settings.
+	disableWebSearch := acc.WebSearchDisabled
+	if sp := strings.TrimSpace(acc.SystemPrompt); sp != "" {
+		answerPrompt = "[Account instructions]\n" + sp + "\n\n" + answerPrompt
 	}
 
 	// Normalize tools once. Selection is always made by the upstream model;
@@ -1880,30 +2190,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			if IsRateLimited(routeErr) && body.AccountID == "" {
-				if next, nerr := s.nextHealthyAccount(acc.ID); nerr == nil {
-					s.accountPool.MarkFailure(acc.ID, routeErr, s.getRateLimitCooldown())
-					routeRes2, routeErr2 := s.chatWithAccount(ctx, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
-					if routeErr2 == nil {
-						routeRes = routeRes2
-						acc = next
-						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-						routeErr = nil
-					} else {
-						s.accountPool.MarkFailure(next.ID, routeErr2, s.getRateLimitCooldown())
-						writeUpstreamErrorWithAccount(w, routeErr2, next.ID)
-						return
-					}
-				}
-			}
-			if routeErr != nil {
-				if IsRateLimited(routeErr) {
-					writeUpstreamErrorWithAccount(w, routeErr, acc.ID)
-				} else {
-					writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "tool router: "+routeErr.Error())
-				}
-				return
-			}
+			log.Printf("[tool-router] failed account=%s err=%v", acc.ID, routeErr)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "tool router: "+routeErr.Error())
+			return
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		calls = filterCompletedCalls(calls, ledger)
@@ -1934,19 +2223,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Stream {
 		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession)
+		answerReq.DisableWebSearch = disableWebSearch
+		answerReq.FirstTokenTimeout = time.Duration(s.settings.get().FirstTokenTimeoutSeconds) * time.Second
 		answerPrompt = answerReq.Text
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d native_tools=%d mcp=%s", requestID, len(answerPrompt), len(answerReq.Tools), mcpServerURL)
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
-			return
-		}
-		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
 			return
 		}
 		sw := newSSEWriter(w, flusher)
@@ -1964,11 +2249,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					_ = sw.raw(": keepalive\n\n")
+					if sw.isCommitted() {
+						_ = sw.raw(": keepalive\n\n")
+					}
 				}
 			}
 		}()
 		var text strings.Builder
+		var pending strings.Builder
 		var streamedTools []detectedToolCall
 		first := true
 		identityFilter := newPublicIdentityStreamFilter(model)
@@ -1994,39 +2282,178 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		}
+		reasoningFilter := newPublicReasoningStreamFilter()
+		emitReasoning := func(part string) error {
+			if part == "" {
+				return nil
+			}
+			if err := r.Context().Err(); err != nil {
+				return err
+			}
+			delta := map[string]any{"reasoning_content": part}
+			if first {
+				delta["role"] = "assistant"
+				first = false
+			}
+			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
+			return sw.data(mustJSON(chunk))
+		}
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
+			if ev.Kind == "reasoning" {
+				return emitReasoning(reasoningFilter.Push(ev.Text))
+			}
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
-				toolKnown := false
-				for _, tm := range toolMaps {
-					if fn, ok := tm["function"].(map[string]any); ok {
-						if fn["name"] == ev.ToolName {
-							toolKnown = true
-							break
-						}
-					}
-				}
-				if toolKnown {
-					streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
-				} else {
-					log.Printf("[tool-event] id=%s skipping unknown native tool %q (not in client-declared tools)", requestID, ev.ToolName)
-				}
+				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 				return nil
 			}
 			if ev.Kind != "text" || ev.Text == "" {
 				return nil
 			}
 			text.WriteString(ev.Text)
-			return emitText(ev.Text)
+			pending.WriteString(ev.Text)
+			v := pending.String()
+			// Detect fenced code blocks (tool calls) that must not be emitted as text.
+			// They will be caught by fencedToolCalls after the stream completes.
+			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
+				return nil
+			}
+			// If we see an opening ```, buffer until the closing ``` or until we're sure it's not a tool call.
+			if i := strings.Index(v, "```"); i >= 0 {
+				after := v[i+3:]
+				// If there's a closing ```, emit everything up to and including the block.
+				if j := strings.Index(after, "```"); j >= 0 {
+					closeIdx := i + 3 + j + 3
+					if err := emitText(v[:i]); err != nil {
+						return err
+					}
+					pending.Reset()
+					pending.WriteString(v[i:closeIdx])
+					return nil
+				}
+				// Opening ``` without closing yet: emit everything before it, keep the fence buffered.
+				if err := emitText(v[:i]); err != nil {
+					return err
+				}
+				pending.Reset()
+				pending.WriteString(v[i:])
+				return nil
+			}
+			// No fence detected: emit immediately with a small tail buffer for fence detection.
+			// This replaces the old 8-rune threshold with a 3-rune buffer (enough to detect "```").
+			if runeCount := utf8.RuneCountInString(v); runeCount > 3 {
+				cut := 0
+				seen := 0
+				for i := range v {
+					if seen == runeCount-3 {
+						cut = i
+						break
+					}
+					seen++
+				}
+				if err := emitText(v[:cut]); err != nil {
+					return err
+				}
+				pending.Reset()
+				pending.WriteString(v[cut:])
+			}
+			return nil
 		})
-		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
+			tried := map[string]bool{acc.ID: true}
+			attempted := []string{acc.ID}
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			origErr := err
+			_ = origErr
+			succeeded := false
+			for {
+				next, ok := s.nextHealthyExcluding(tried)
+				if !ok {
+					// no healthy alternative, will report exhausted below
+					break
+				}
+				tried[next.ID] = true
+				attempted = append(attempted, next.ID)
+				failoverReq := answerReq
+				if body.ConversationID == resolvedConversationID {
+					failoverReq.ConversationID = ""
+					failoverReq.SessionID = ""
+				}
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
+					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
+						streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
+						return nil
+					}
+					if ev.Kind != "text" || ev.Text == "" {
+						return nil
+					}
+					text.WriteString(ev.Text)
+					pending.WriteString(ev.Text)
+					v := pending.String()
+					if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
+						return nil
+					}
+					if i := strings.Index(v, "```"); i >= 0 {
+						if err := emitText(v[:i]); err != nil {
+							return err
+						}
+						pending.Reset()
+						pending.WriteString(v[i:])
+						return nil
+					}
+					if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
+						cut := 0
+						seen := 0
+						for i := range v {
+							if seen == runeCount-8 {
+								cut = i
+								break
+							}
+							seen++
+						}
+						if err := emitText(v[:cut]); err != nil {
+							return err
+						}
+						pending.Reset()
+						pending.WriteString(v[cut:])
+					}
+					return nil
+				})
+				cancel2()
+				if err2 == nil {
+					s.accountPool.MarkSuccess(next.ID)
+					res = res2
+					acc = next
+					err = nil
+					succeeded = true
+					break
+				}
+				if isThrottledForFailover(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+					err = err2
+					continue
+				}
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(next.ID)
+				}
+				err = err2
+				acc = next
+				break
+			}
+			if !succeeded && isThrottledForFailover(err) && len(attempted) > 1 {
+				// check if no healthy left
+				if _, ok := s.nextHealthyExcluding(tried); !ok {
+					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "所有账号均触发限流，请稍后重试", "type": "rate_limit_error", "code": "rate_limit_exhausted"}, "total_accounts": len(s.tokens.List()), "throttled_accounts": func() int { _, t, _, _ := s.failoverStats(attempted); return t }(), "healthy_accounts": func() int { _, _, h, _ := s.failoverStats(attempted); return h }(), "attempted_accounts": len(attempted), "failover_status": "exhausted"})+"\n\n")
+					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+					return
+				}
+			}
+		} else if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
 			originalErr := err
-			// A throttled stream may retry on the next healthy account: only the
-			// ": connected" preamble reached the client, so the retried stream is
-			// indistinguishable from a fresh request.
 			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr != nil {
-				// no healthy alternative
-			} else {
+			if nerr == nil {
 				failoverReq := answerReq
 				if body.ConversationID == resolvedConversationID {
 					failoverReq.ConversationID = ""
@@ -2036,37 +2463,59 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				defer cancel2()
 				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
 					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
-						toolKnown := false
-						for _, tm := range toolMaps {
-							if fn, ok := tm["function"].(map[string]any); ok {
-								if fn["name"] == ev.ToolName {
-									toolKnown = true
-									break
-								}
-							}
-						}
-						if toolKnown {
-							streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
-						}
+						streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 						return nil
 					}
 					if ev.Kind != "text" || ev.Text == "" {
 						return nil
 					}
 					text.WriteString(ev.Text)
-					return emitText(ev.Text)
+					pending.WriteString(ev.Text)
+					v := pending.String()
+					if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
+						return nil
+					}
+					if i := strings.Index(v, "```"); i >= 0 {
+						if err := emitText(v[:i]); err != nil {
+							return err
+						}
+						pending.Reset()
+						pending.WriteString(v[i:])
+						return nil
+					}
+					if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
+						cut := 0
+						seen := 0
+						for i := range v {
+							if seen == runeCount-8 {
+								cut = i
+								break
+							}
+							seen++
+						}
+						if err := emitText(v[:cut]); err != nil {
+							return err
+						}
+						pending.Reset()
+						pending.WriteString(v[cut:])
+					}
+					return nil
 				})
 				if err2 == nil {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkSuccess(next.ID)
 					res = res2
 					acc = next
 					err = nil
 				} else {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -2076,6 +2525,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -2094,12 +2544,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
-		if res.Throttling != nil && s.accountPool != nil {
-			s.accountPool.UpdateThrottling(acc.ID, res.Throttling)
-			s.logThrottlingWarning(acc.ID, res.Throttling)
-		}
+		s.accountPool.MarkSuccess(acc.ID)
+		s.applyResultMetering(acc.ID, res)
 		if isContentPolicyBlock(res.Text) {
 			log.Printf("[content-policy] M365 blocked the request (streaming), sending error")
+			s.accountPool.MarkFailure(acc.ID, chathub.ErrOffensiveContent, s.getRateLimitCooldown())
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "M365 content policy blocked this request; try again or switch account", "code": "upstream_content_blocked"}})+"\n\n")
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
@@ -2111,6 +2560,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if text.Len() == 0 && strings.TrimSpace(res.Text) != "" {
 			text.WriteString(res.Text)
+			pending.WriteString(res.Text)
 		}
 		rawCalls := streamedTools
 		if len(rawCalls) == 0 {
@@ -2161,6 +2611,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
+		if err := emitText(pending.String()); err != nil {
+			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
+			return
+		}
+		if err := emitReasoning(reasoningFilter.Flush()); err != nil {
+			log.Printf("[req-trace] id=%s stage=stream_write_reasoning err=%v", requestID, err)
+			return
+		}
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 		if res.Throttling != nil {
 			finishChunk["x_m365_throttling"] = res.Throttling
@@ -2186,7 +2644,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		if routeErr != nil {
-			if IsRateLimited(routeErr) || IsAuthFailure(routeErr) {
+			s.accountPool.MarkFailure(acc.ID, routeErr, s.getRateLimitCooldown())
+			if IsFailoverRetriable(routeErr) {
 				next, nerr := s.nextHealthyAccount(acc.ID)
 				if nerr == nil {
 					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
@@ -2196,6 +2655,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						acc = next
 						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 					} else {
+						s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					}
 				}
 			}
@@ -2207,6 +2667,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusBadGateway, "tool_router_error", msg)
 				return
 			}
+			s.accountPool.MarkSuccess(acc.ID)
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		if !parsed {
@@ -2262,13 +2723,15 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession)
+	answerReq.DisableWebSearch = disableWebSearch
+	answerReq.FirstTokenTimeout = time.Duration(s.settings.get().FirstTokenTimeoutSeconds) * time.Second
 	answerPrompt = answerReq.Text
 	var res chathub.Result
+	// NOTE: streaming is fully handled by the earlier `if body.Stream` branch,
+	// which always returns before reaching here, so this duplicate stream
+	// branch is unreachable. Do not add new streaming logic here — the live
+	// path is the one above (issue #83 reasoning streaming was fixed there).
 	if body.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
@@ -2297,8 +2760,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		contentFilter := newPublicIdentityStreamFilter(firstNonEmpty(body.Model, defaultPublicModelName))
 		reasoningFilter := newPublicReasoningStreamFilter()
+		streamedContentLen := 0
 		onDelta := func(content string) error {
 			if content = contentFilter.Push(content); content != "" {
+				streamedContentLen += len(content)
 				return writeChunk(map[string]any{"content": content})
 			}
 			return nil
@@ -2309,42 +2774,55 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			return nil
 		}
-		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
-			return
-		}
-		ticker2 := time.NewTicker(15 * time.Second)
-		defer ticker2.Stop()
-		keepaliveDone2 := make(chan struct{})
-		defer close(keepaliveDone2)
-		go func() {
+		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDelta, onReasoning)
+		if err != nil && !sw2.isCommitted() && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
+			tried := map[string]bool{acc.ID: true}
+			attempted := []string{acc.ID}
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			for {
-				select {
-				case <-keepaliveDone2:
+				next, ok := s.nextHealthyExcluding(tried)
+				if !ok {
+					break
+				}
+				tried[next.ID] = true
+				attempted = append(attempted, next.ID)
+				failoverReq := answerReq
+				if body.ConversationID == resolvedConversationID {
+					failoverReq.ConversationID = ""
+					failoverReq.SessionID = ""
+				}
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning)
+				cancel2()
+				if err2 == nil {
+					s.accountPool.MarkSuccess(next.ID)
+					res = res2
+					acc = next
+					err = nil
+					break
+				}
+				if isThrottledForFailover(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+					err = err2
+					acc = next
+					continue
+				}
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(next.ID)
+				}
+				err = err2
+				acc = next
+				break
+			}
+			if err != nil && isThrottledForFailover(err) {
+				if _, ok := s.nextHealthyExcluding(tried); !ok {
+					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "所有账号均触发限流，请稍后重试", "type": "rate_limit_error", "code": "rate_limit_exhausted"}, "total_accounts": len(s.tokens.List()), "throttled_accounts": func() int { _, t, _, _ := s.failoverStats(attempted); return t }(), "healthy_accounts": func() int { _, _, h, _ := s.failoverStats(attempted); return h }(), "attempted_accounts": len(attempted), "failover_status": "exhausted"})+"\n\n")
+					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 					return
-				case <-r.Context().Done():
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker2.C:
-					_ = sw2.raw(": keepalive\n\n")
 				}
 			}
-		}()
-		streamedReasoningLen := 0
-		onDeltaWrapped := func(content string) error {
-			if content != "" {
-				streamedReasoningLen += len(content)
-			}
-			return onDelta(content)
-		}
-		onReasoningWrapped := func(reasoning string) error {
-			if reasoning != "" {
-				streamedReasoningLen += len(reasoning)
-			}
-			return onReasoning(reasoning)
-		}
-		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
-		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		} else if err != nil && !sw2.isCommitted() && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
@@ -2356,16 +2834,20 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
 				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkSuccess(next.ID)
 					res = res2
 					acc = next
 					err = nil
 				} else {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -2375,6 +2857,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		if err == nil {
 			if content := contentFilter.Flush(); content != "" {
+				streamedContentLen += len(content)
 				if writeErr := writeChunk(map[string]any{"content": content}); writeErr != nil {
 					return
 				}
@@ -2385,13 +2868,21 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 			}
 			res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)
+			if fallback := streamFinalResultFallback(streamedContentLen, res.Text); fallback != "" {
+				if writeErr := writeChunk(map[string]any{"content": fallback}); writeErr != nil {
+					return
+				}
+				streamedContentLen += len(fallback)
+			}
 			res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
+			s.accountPool.MarkSuccess(acc.ID)
 			if res.Throttling != nil && s.accountPool != nil {
 				s.accountPool.UpdateThrottling(acc.ID, res.Throttling)
 				s.logThrottlingWarning(acc.ID, res.Throttling)
 			}
 			if isContentPolicyBlock(res.Text) {
 				log.Printf("[content-policy] M365 blocked the request (reasoning stream), sending error")
+				s.accountPool.MarkFailure(acc.ID, chathub.ErrOffensiveContent, s.getRateLimitCooldown())
 				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "M365 content policy blocked this request; try again or switch account", "code": "upstream_content_blocked"}})+"\n\n")
 				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 				return
@@ -2403,6 +2894,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -2417,6 +2909,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				msg = "M365 content policy flagged this request as offensive"
 			}
 			msg = sanitizePublicInternalText(msg)
+			if !sw2.isCommitted() {
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", msg)
+				return
+			}
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 		}
 		pt := EstimateTokens(prompt)
@@ -2452,10 +2948,55 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
-		if err != nil && !convReused && body.AccountID == "" && (IsRateLimited(err) || IsAuthFailure(err)) && (IsRateLimited(err) || body.ConversationID == "" || body.ConversationID == resolvedConversationID) {
+		if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
+			tried := map[string]bool{acc.ID: true}
+			attempted := []string{acc.ID}
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			for {
+				next, ok := s.nextHealthyExcluding(tried)
+				if !ok {
+					s.writeFailoverExhausted(w, attempted)
+					return
+				}
+				tried[next.ID] = true
+				attempted = append(attempted, next.ID)
+				failoverReq := answerReq
+				if body.ConversationID == resolvedConversationID {
+					failoverReq.ConversationID = ""
+					failoverReq.SessionID = ""
+				}
+				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
+				cancel2()
+				if err2 == nil {
+					s.accountPool.MarkSuccess(next.ID)
+					res = res2
+					acc = next
+					err = nil
+					break
+				}
+				if isThrottledForFailover(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+					err = err2
+					acc = next
+					continue
+				}
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(next.ID)
+				}
+				err = err2
+				acc = next
+				break
+			}
+			if err != nil && isThrottledForFailover(err) {
+				if _, ok := s.nextHealthyExcluding(tried); !ok {
+					s.writeFailoverExhausted(w, attempted)
+					return
+				}
+			}
+		} else if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
 			originalErr := err
-			// Failover only when nothing pins the request to a conversation or
-			// account; a fresh chat can safely retry on the next healthy account.
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
 				failoverReq := answerReq
@@ -2467,16 +3008,20 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
 				if err2 == nil {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkSuccess(next.ID)
 					res = res2
 					acc = next
 					err = nil
 				} else {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -2486,6 +3031,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	if err != nil {
+		s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
@@ -2493,32 +3039,38 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.invalidateConvCache(acc.ID, convCacheModel)
 			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
 		}
+		if isThrottledForFailover(err) {
+			s.writeFailoverExhausted(w, []string{acc.ID})
+			return
+		}
 		writeUpstreamErrorWithAccount(w, err, acc.ID)
 		return
 	}
-	if res.Throttling != nil && s.accountPool != nil {
-		s.accountPool.UpdateThrottling(acc.ID, res.Throttling)
-		s.logThrottlingWarning(acc.ID, res.Throttling)
-	}
+	s.accountPool.MarkSuccess(acc.ID)
+	s.applyResultMetering(acc.ID, res)
 	if body.Stream {
-		if body.User != "" && res.ConversationID != "" {
+		if !tempSession && body.User != "" && res.ConversationID != "" {
 			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		if !tempSession {
+			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		}
 		return
 	}
 
 	if body.SessionKey != "" {
 		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
-	if body.User != "" && res.ConversationID != "" {
+	if !tempSession && body.User != "" && res.ConversationID != "" {
 		s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		log.Printf("[user-session] put user=%s conversation=%s session=%s", body.User, res.ConversationID, res.SessionID)
 	}
 	if res.ConversationID != "" {
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		if !tempSession {
+			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		}
 	}
 	if res.ConversationID != "" {
 		resolved := s.sessionResolver.Resolve(r, &body)
@@ -2788,6 +3340,13 @@ func (s *Server) writePublicIdentityChatResponse(w http.ResponseWriter, r *http.
 
 const defaultPublicModelName = "m365-copilot"
 
+func streamFinalResultFallback(streamedContentLen int, final string) string {
+	if streamedContentLen == 0 && strings.TrimSpace(final) != "" {
+		return final
+	}
+	return ""
+}
+
 const sessionHeaderName = "X-M365-Session-Id"
 
 // bindConversation 在请求完成后登记会话解析器索引与缓存统计，流式与非流式
@@ -2804,6 +3363,9 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 		ReasoningContent: res.Reasoning,
 	})
 	s.sessionResolver.Bind(res.SessionID, res.ConversationID, acc.ID, &historyBody, "", r)
+	if s.contextAffinity != nil {
+		s.contextAffinity.BindConversation(acc.ID, res.ConversationID, res.SessionID, &historyBody, r)
+	}
 	s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
 	if s.conversationManager.ShouldCleanup() {
 		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {

@@ -229,14 +229,16 @@ func sanitizePublicInternalText(text string) string {
 	return publicProviderIdentityPattern.ReplaceAllString(text, publicAssistantIdentity)
 }
 
-// stripReplacementChars 去掉上游按字节截断产生的 U+FFFD 替换字符。
-// 它始终生效，与 opt-in 的身份策略无关——U+FFFD 从来不是合法内容。
+// stripReplacementChars removes U+FFFD replacement characters produced by
+// upstream byte-level truncation. It always applies, independent of the
+// opt-in identity policy, because U+FFFD is never legitimate content.
 //
-// 注意 strings.IndexRune 会把「字面 U+FFFD」和「任何非法 UTF-8 字节」
-// 都判为 RuneError，但 ReplaceAll 只删得掉编码后的 U+FFFD 序列。
-// 一个被上游分片切断的多字节字符会留下裸的非法字节，encoding/json
-// 在 marshal 时会把它重新变成 U+FFFD 送给客户端。用 ToValidUTF8
-// 把这些残留字节丢掉，客户端就再也看不到替换字符了。
+// IndexRune treats both a literal U+FFFD and any invalid UTF-8 byte as
+// RuneError, but ReplaceAll only removes the encoded U+FFFD sequence. A rune
+// split across upstream fragments leaves raw invalid bytes behind, and
+// encoding/json would then re-introduce U+FFFD when it marshals the value for
+// the client. ToValidUTF8 drops those leftover bytes so the client never sees
+// a replacement character.
 func stripReplacementChars(text string) string {
 	if text == "" || strings.IndexRune(text, utf8.RuneError) < 0 {
 		return text
@@ -248,9 +250,10 @@ func stripReplacementChars(text string) string {
 	return strings.ToValidUTF8(text, "")
 }
 
-// utf8SafeCut 返回 s 中「结束在一个完整 UTF-8 序列边界上」的最长前缀字节数。
-// 末尾不完整的那截会被扣住，等下一片到达时再拼回去，而不是直接丢掉或
-// 变成 U+FFFD。
+// utf8SafeCut returns the byte length of the longest prefix of s that ends on a
+// complete UTF-8 sequence boundary. An incomplete trailing sequence is held
+// back so a rune split across upstream fragments is reassembled on the next
+// fragment instead of being dropped or turned into U+FFFD.
 func utf8SafeCut(s string) int {
 	n := len(s)
 	for i := 1; i <= 3 && i <= n; i++ {
@@ -275,6 +278,49 @@ func utf8SafeCut(s string) int {
 		}
 	}
 	return n
+}
+
+var (
+	citationOpen  = string(rune(0xE200)) + "cite" + string(rune(0xE202))
+	citationClose = string(rune(0xE201))
+)
+
+// stripCitationMarkersStream removes upstream citation markers
+// (\uE200cite\uE202<id>\uE201) from a text fragment and returns the cleaned
+// prefix plus the unconsumed remainder, which is an incomplete marker to carry
+// over to the next fragment. It keeps public API responses free of the private
+// upstream citation control markup (issue #79).
+func stripCitationMarkersStream(pending string) (string, string) {
+	var b strings.Builder
+	for {
+		i := strings.Index(pending, citationOpen)
+		if i < 0 {
+			break
+		}
+		b.WriteString(pending[:i])
+		after := pending[i+len(citationOpen):]
+		j := strings.Index(after, citationClose)
+		if j < 0 {
+			// Incomplete marker: keep from the marker start.
+			return b.String(), pending[i:]
+		}
+		pending = after[j+len(citationClose):]
+	}
+	// Hold back a trailing partial marker prefix so a marker split across
+	// fragments is not emitted half-formed.
+	keep := 0
+	max := len(citationOpen) - 1
+	if max > len(pending) {
+		max = len(pending)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(pending, citationOpen[:n]) {
+			keep = n
+			break
+		}
+	}
+	b.WriteString(pending[:len(pending)-keep])
+	return b.String(), pending[len(pending)-keep:]
 }
 
 func sanitizePublicReasoningText(text string) string {
@@ -440,6 +486,7 @@ func sanitizePublicJSONValue(value any) any {
 
 type publicIdentityStreamFilter struct {
 	pending         string
+	citePending     string
 	identityWritten bool
 	model           string
 }
@@ -457,13 +504,14 @@ func (f *publicIdentityStreamFilter) Push(fragment string) string {
 		return sanitizePublicAssistantText(fragment)
 	}
 	if !publicIdentityPolicyEnabled() {
-		// 扣住末尾不完整的多字节序列，等下一片到达时拼回来。
-		// 直接 return fragment 会把被切断的字符变成 U+FFFD。
 		f.pending += fragment
 		cut := utf8SafeCut(f.pending)
 		out := f.pending[:cut]
 		f.pending = f.pending[cut:]
-		return stripReplacementChars(out)
+		f.citePending += stripReplacementChars(out)
+		cleaned, rest := stripCitationMarkersStream(f.citePending)
+		f.citePending = rest
+		return cleaned
 	}
 	f.pending += fragment
 	return f.consume(false)
@@ -476,7 +524,9 @@ func (f *publicIdentityStreamFilter) Flush() string {
 	if !publicIdentityPolicyEnabled() {
 		out := stripReplacementChars(f.pending)
 		f.pending = ""
-		return out
+		cleaned, _ := stripCitationMarkersStream(f.citePending + out)
+		f.citePending = ""
+		return cleaned
 	}
 	out := f.consume(true)
 	f.pending = ""
@@ -508,11 +558,12 @@ func (f *publicIdentityStreamFilter) consume(final bool) string {
 	}
 	out := f.pending[:cut]
 	f.pending = f.pending[cut:]
-	return out
+	return stripReplacementChars(out)
 }
 
 type publicReasoningStreamFilter struct {
-	pending string
+	pending     string
+	citePending string
 }
 
 func newPublicReasoningStreamFilter() *publicReasoningStreamFilter {
@@ -524,12 +575,14 @@ func (f *publicReasoningStreamFilter) Push(fragment string) string {
 		return sanitizePublicReasoningText(fragment)
 	}
 	if !publicIdentityPolicyEnabled() {
-		// 同上：reasoning 通道同样会被上游按字节截断。
 		f.pending += fragment
 		cut := utf8SafeCut(f.pending)
 		out := f.pending[:cut]
 		f.pending = f.pending[cut:]
-		return stripReplacementChars(out)
+		f.citePending += stripReplacementChars(out)
+		cleaned, rest := stripCitationMarkersStream(f.citePending)
+		f.citePending = rest
+		return cleaned
 	}
 	f.pending += fragment
 	return f.consume(false)
@@ -542,7 +595,9 @@ func (f *publicReasoningStreamFilter) Flush() string {
 	if !publicIdentityPolicyEnabled() {
 		out := stripReplacementChars(f.pending)
 		f.pending = ""
-		return out
+		cleaned, _ := stripCitationMarkersStream(f.citePending + out)
+		f.citePending = ""
+		return cleaned
 	}
 	out := sanitizePublicReasoningText(f.pending)
 	f.pending = ""
@@ -559,8 +614,12 @@ func (f *publicReasoningStreamFilter) consume(final bool) string {
 		return sanitizePublicReasoningText(chunk)
 	}
 	if len(f.pending) > 4096 {
-		chunk := f.pending[:len(f.pending)-256]
-		f.pending = f.pending[len(f.pending)-256:]
+		cut := len(f.pending) - 256
+		for cut > 0 && !utf8.RuneStart(f.pending[cut]) {
+			cut--
+		}
+		chunk := f.pending[:cut]
+		f.pending = f.pending[cut:]
 		return sanitizePublicReasoningText(chunk)
 	}
 	return ""

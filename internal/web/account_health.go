@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,7 +56,7 @@ func ClassifyError(err error) ErrorCategory {
 	if errors.Is(err, context.Canceled) {
 		return CategoryClientCanceled
 	}
-	if errors.Is(err, chathub.ErrRateLimitNotice) || errors.Is(err, chathub.ErrMeteringThrottled) {
+	if errors.Is(err, chathub.ErrRateLimitNotice) {
 		return CategoryQuota429
 	}
 	if errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, chathub.ErrOffensiveContent) || errors.Is(err, chathub.ErrImageLimit) {
@@ -182,12 +184,12 @@ func IsRateLimited(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, chathub.ErrRateLimitNotice) || errors.Is(err, chathub.ErrMeteringThrottled) {
+	if errors.Is(err, chathub.ErrRateLimitNotice) {
 		return true
 	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
-		if httpErr.Status == 429 || httpErr.Status == 503 {
+		if httpErr.Status == 429 {
 			return true
 		}
 		low := strings.ToLower(httpErr.Body)
@@ -197,14 +199,48 @@ func IsRateLimited(err error) bool {
 	}
 	var dialErr *chathub.DialError
 	if errors.As(err, &dialErr) {
-		if dialErr.Status == 429 || dialErr.Status == 503 {
+		if dialErr.Status == 429 {
 			return true
 		}
-		if dialErr.Kind == "QUOTA_429" || dialErr.Kind == "OVERLOAD_503" {
+		if dialErr.Kind == "QUOTA_429" {
 			return true
 		}
 	}
 	return false
+}
+
+func IsOverload(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *UpstreamHTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 503 {
+		return true
+	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) && (dialErr.Status == 503 || dialErr.Kind == "OVERLOAD_503") {
+		return true
+	}
+	return ClassifyError(err) == CategoryOverload503
+}
+
+func IsTransientTransport(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch ClassifyError(err) {
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout, CategoryOverload503:
+		return true
+	}
+	return false
+}
+
+func IsFailoverRetriable(err error) bool {
+	if IsRateLimited(err) || IsOverload(err) || IsAuthFailure(err) || IsTransientTransport(err) {
+		return true
+	}
+	// HAR 实证上游 422 属可重试成员，纳入故障转移白名单。
+	return ClassifyError(err) == CategoryRetryable422
 }
 
 func IsAuthFailure(err error) bool {
@@ -238,6 +274,30 @@ func RetryAfterSeconds(err error) int {
 	return 0
 }
 
+func transientThrottledCooldown() time.Duration {
+	n := envIntTransient()
+	if n < 5 {
+		n = 15
+	}
+	if n > 600 {
+		n = 600
+	}
+	return time.Duration(n) * time.Second
+}
+
+func envIntTransient() int {
+	v := 0
+	if s := strings.TrimSpace(os.Getenv("M365_TRANSIENT_THROTTLED_COOLDOWN_SECONDS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			v = n
+		}
+	}
+	if v == 0 {
+		v = 15
+	}
+	return v
+}
+
 func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Duration {
 	switch cat {
 	case CategoryQuota429:
@@ -254,7 +314,8 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 		if attempt > 7 {
 			attempt = 7
 		}
-		d := 30 * time.Second * time.Duration(1<<(attempt-1))
+		base := transientThrottledCooldown()
+		d := base * time.Duration(1<<(attempt-1))
 		if d > 30*time.Minute || d <= 0 {
 			d = 30 * time.Minute
 		}
@@ -358,14 +419,12 @@ func (g *globalCircuitState) Record(err error) {
 	cat := ClassifyError(err)
 	switch cat {
 	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
-		// Only shared transport and infrastructure failures contribute to the
-		// global circuit. Account-, policy-, quota-, and request-specific errors
-		// are handled by per-account health state.
 	default:
-		// Client cancels are not upstream faults. Failures already classified
-		// as GLOBAL_UNAVAILABLE must not re-arm the circuit, otherwise traffic
-		// rejected while the circuit is open keeps renewing openUntil forever
-		// and the circuit can never close.
+		if cat == CategoryClientCanceled || cat == CategoryGlobalUnavailable {
+			return
+		}
+		// Only shared transport / infrastructure failures contribute to the global circuit.
+		// Quota, overload, auth, and request-specific errors are per-account.
 		return
 	}
 	g.mu.Lock()
@@ -412,11 +471,10 @@ type accountHealth struct {
 	imageGenCooldownUntil  map[string]time.Time
 	imageGenSystemCooldown map[string]time.Time
 	lastThrottling         map[string]any
-	lastMeterError         map[string]string
-	lastMeterAccess        map[string]bool
-	remainingAllowance     map[string]map[string]int
 	authFailReason         map[string]string
 	quotaAttempts          map[string]int
+	lastCategory           ErrorCategory
+	lastCategoryAt         time.Time
 }
 
 func newAccountHealth() *accountHealth {
@@ -431,12 +489,33 @@ func newAccountHealth() *accountHealth {
 		imageGenCooldownUntil:  map[string]time.Time{},
 		imageGenSystemCooldown: map[string]time.Time{},
 		lastThrottling:         map[string]any{},
-		lastMeterError:         map[string]string{},
-		lastMeterAccess:        map[string]bool{},
-		remainingAllowance:     map[string]map[string]int{},
 		authFailReason:         map[string]string{},
 		quotaAttempts:          map[string]int{},
 	}
+}
+
+// LastCategory reports the most recent failure category recorded by
+// MarkFailure. resolveAccount uses it to distinguish local network failures
+// from upstream rate limiting (issue #79).
+func (h *accountHealth) LastCategory() (ErrorCategory, time.Time) {
+	if h == nil {
+		return CategoryUnknown, time.Time{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastCategory, h.lastCategoryAt
+}
+
+// IsTransportCategory reports whether the category is a local/transport
+// failure rather than an upstream quota or auth rejection. Upstream overload
+// (503) is deliberately excluded: it is a server-side capacity signal, not a
+// local connectivity fault, so it must not be reported as network_error.
+func IsTransportCategory(cat ErrorCategory) bool {
+	switch cat {
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
+		return true
+	}
+	return false
 }
 
 func (h *accountHealth) cleanupExpiredCooldownLocked(accountID string) {
@@ -561,52 +640,7 @@ func (h *accountHealth) UpdateThrottling(accountID string, data any) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	b, err := json.Marshal(data)
-	if err != nil {
-		return
-	}
-	var copied any
-	if json.Unmarshal(b, &copied) != nil {
-		return
-	}
-	h.lastThrottling[accountID] = copied
-}
-
-func (h *accountHealth) UpdateMetering(accountID, meterError string, hasAccess bool, remaining map[string]int) {
-	if h == nil || accountID == "" {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.lastMeterError[accountID] = meterError
-	h.lastMeterAccess[accountID] = hasAccess
-	if len(remaining) == 0 {
-		delete(h.remainingAllowance, accountID)
-		return
-	}
-	copyRemaining := make(map[string]int, len(remaining))
-	for capability, allowance := range remaining {
-		copyRemaining[capability] = allowance
-	}
-	h.remainingAllowance[accountID] = copyRemaining
-}
-
-func (h *accountHealth) GetMetering(accountID string) (string, bool, map[string]int) {
-	if h == nil {
-		return "", true, nil
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	remaining := h.remainingAllowance[accountID]
-	copyRemaining := make(map[string]int, len(remaining))
-	for capability, allowance := range remaining {
-		copyRemaining[capability] = allowance
-	}
-	hasAccess, ok := h.lastMeterAccess[accountID]
-	if !ok {
-		hasAccess = true
-	}
-	return h.lastMeterError[accountID], hasAccess, copyRemaining
+	h.lastThrottling[accountID] = data
 }
 
 func (h *accountHealth) GetThrottling(accountID string) any {
@@ -648,6 +682,10 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 	if cat == CategoryClientCanceled {
 		return
 	}
+	h.mu.Lock()
+	h.lastCategory = cat
+	h.lastCategoryAt = time.Now()
+	h.mu.Unlock()
 	if cat == CategoryGlobalUnavailable {
 		h.mu.Lock()
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
@@ -703,11 +741,6 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
 		h.limited[accountID] = true
-		if errors.Is(err, chathub.ErrMeteringThrottled) && RetryAfterSeconds(err) == 0 {
-			h.quotaAttempts[accountID] = 0
-			h.cooldown[accountID] = time.Now().Add(15 * time.Minute)
-			return
-		}
 		attempt := h.quotaAttempts[accountID] + 1
 		h.quotaAttempts[accountID] = attempt
 		cd := CooldownForCategory(cat, RetryAfterSeconds(err), attempt)
@@ -716,11 +749,13 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 	case CategoryOverload503:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
+		delete(h.limited, accountID)
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), 1))
 		return
 	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
+		delete(h.limited, accountID)
 		cd := CooldownForCategory(cat, 0, 1)
 		h.cooldown[accountID] = time.Now().Add(cd)
 		return
@@ -843,15 +878,6 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 	for id := range h.lastThrottling {
 		ids[id] = true
 	}
-	for id := range h.lastMeterError {
-		ids[id] = true
-	}
-	for id := range h.lastMeterAccess {
-		ids[id] = true
-	}
-	for id := range h.remainingAllowance {
-		ids[id] = true
-	}
 	for id := range h.calls {
 		ids[id] = true
 	}
@@ -896,27 +922,7 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 			}
 		}
 		if t := h.lastThrottling[id]; t != nil {
-			if b, err := json.Marshal(t); err == nil {
-				var copied any
-				if json.Unmarshal(b, &copied) == nil {
-					m["throttling"] = copied
-				}
-			}
-		}
-		if meterError := h.lastMeterError[id]; meterError != "" {
-			m["meterError"] = meterError
-		}
-		hasAccess, ok := h.lastMeterAccess[id]
-		if !ok {
-			hasAccess = true
-		}
-		m["hasAccess"] = hasAccess
-		if remaining := h.remainingAllowance[id]; len(remaining) > 0 {
-			copied := make(map[string]int, len(remaining))
-			for capability, allowance := range remaining {
-				copied[capability] = allowance
-			}
-			m["remainingAllowance"] = copied
+			m["throttling"] = t
 		}
 		if r := h.authFailReason[id]; r != "" {
 			m["authFailReason"] = r
@@ -947,9 +953,6 @@ func (h *accountHealth) ClearAllCooldowns() {
 	h.imageGenCooldownUntil = map[string]time.Time{}
 	h.imageGenSystemCooldown = map[string]time.Time{}
 	h.lastThrottling = map[string]any{}
-	h.lastMeterError = map[string]string{}
-	h.lastMeterAccess = map[string]bool{}
-	h.remainingAllowance = map[string]map[string]int{}
 	h.authFailReason = map[string]string{}
 	h.quotaAttempts = map[string]int{}
 	ResetGlobalCircuit()
