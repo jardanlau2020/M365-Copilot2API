@@ -213,6 +213,7 @@ func sanitizePublicAssistantText(text string) string {
 }
 
 func sanitizePublicAssistantTextForModel(text, model string) string {
+	text = stripReplacementChars(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
@@ -221,13 +222,63 @@ func sanitizePublicAssistantTextForModel(text, model string) string {
 }
 
 func sanitizePublicInternalText(text string) string {
+	text = stripReplacementChars(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
 	return publicProviderIdentityPattern.ReplaceAllString(text, publicAssistantIdentity)
 }
 
+// stripReplacementChars 去掉上游按字节截断产生的 U+FFFD 替换字符。
+// 它始终生效，与 opt-in 的身份策略无关——U+FFFD 从来不是合法内容。
+//
+// 注意 strings.IndexRune 会把「字面 U+FFFD」和「任何非法 UTF-8 字节」
+// 都判为 RuneError，但 ReplaceAll 只删得掉编码后的 U+FFFD 序列。
+// 一个被上游分片切断的多字节字符会留下裸的非法字节，encoding/json
+// 在 marshal 时会把它重新变成 U+FFFD 送给客户端。用 ToValidUTF8
+// 把这些残留字节丢掉，客户端就再也看不到替换字符了。
+func stripReplacementChars(text string) string {
+	if text == "" || strings.IndexRune(text, utf8.RuneError) < 0 {
+		return text
+	}
+	text = strings.ReplaceAll(text, string(utf8.RuneError), "")
+	if utf8.ValidString(text) {
+		return text
+	}
+	return strings.ToValidUTF8(text, "")
+}
+
+// utf8SafeCut 返回 s 中「结束在一个完整 UTF-8 序列边界上」的最长前缀字节数。
+// 末尾不完整的那截会被扣住，等下一片到达时再拼回去，而不是直接丢掉或
+// 变成 U+FFFD。
+func utf8SafeCut(s string) int {
+	n := len(s)
+	for i := 1; i <= 3 && i <= n; i++ {
+		c := s[n-i]
+		if c < 0x80 {
+			return n
+		}
+		if c&0xC0 != 0x80 {
+			size := 1
+			switch {
+			case c&0xF8 == 0xF0:
+				size = 4
+			case c&0xF0 == 0xE0:
+				size = 3
+			case c&0xE0 == 0xC0:
+				size = 2
+			}
+			if i == size {
+				return n
+			}
+			return n - i
+		}
+	}
+	return n
+}
+
 func sanitizePublicReasoningText(text string) string {
+	text = stripReplacementChars(text)
 	if !publicIdentityPolicyEnabled() {
 		return text
 	}
@@ -245,6 +296,7 @@ func sanitizePublicAssistantTextWithStateForModel(text string, identityWritten *
 	if text == "" {
 		return ""
 	}
+	text = stripReplacementChars(text)
 	text = publicInternalCitationPattern.ReplaceAllString(text, "")
 	var out strings.Builder
 	written := identityWritten != nil && *identityWritten
@@ -405,7 +457,13 @@ func (f *publicIdentityStreamFilter) Push(fragment string) string {
 		return sanitizePublicAssistantText(fragment)
 	}
 	if !publicIdentityPolicyEnabled() {
-		return fragment
+		// 扣住末尾不完整的多字节序列，等下一片到达时拼回来。
+		// 直接 return fragment 会把被切断的字符变成 U+FFFD。
+		f.pending += fragment
+		cut := utf8SafeCut(f.pending)
+		out := f.pending[:cut]
+		f.pending = f.pending[cut:]
+		return stripReplacementChars(out)
 	}
 	f.pending += fragment
 	return f.consume(false)
@@ -416,7 +474,7 @@ func (f *publicIdentityStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := f.pending
+		out := stripReplacementChars(f.pending)
 		f.pending = ""
 		return out
 	}
@@ -466,7 +524,12 @@ func (f *publicReasoningStreamFilter) Push(fragment string) string {
 		return sanitizePublicReasoningText(fragment)
 	}
 	if !publicIdentityPolicyEnabled() {
-		return fragment
+		// 同上：reasoning 通道同样会被上游按字节截断。
+		f.pending += fragment
+		cut := utf8SafeCut(f.pending)
+		out := f.pending[:cut]
+		f.pending = f.pending[cut:]
+		return stripReplacementChars(out)
 	}
 	f.pending += fragment
 	return f.consume(false)
@@ -477,7 +540,7 @@ func (f *publicReasoningStreamFilter) Flush() string {
 		return ""
 	}
 	if !publicIdentityPolicyEnabled() {
-		out := f.pending
+		out := stripReplacementChars(f.pending)
 		f.pending = ""
 		return out
 	}
