@@ -39,6 +39,8 @@ export function AccountsPage({ push }: { push: Push }) {
   const [testModels, setTestModels] = useState<string[]>([]);
   const [testModel, setTestModel] = useState("");
   const [testPrompt, setTestPrompt] = useState('Say "OK" in one word.');
+  // 按账号 probe/test：留空 = 自动选号（默认行为）
+  const [testAccountId, setTestAccountId] = useState("");
   const [testResult, setTestResult] = useState<{ status: "idle" | "busy" | "ok" | "fail"; latencyMs?: number; reply?: string; error?: string }>({ status: "idle" });
 
   const openTest = async () => {
@@ -59,7 +61,7 @@ export function AccountsPage({ push }: { push: Push }) {
     setTestResult({ status: "busy" });
     const started = performance.now();
     try {
-      const d = await api("/api/admin/models/test", { method: "POST", body: JSON.stringify({ model: testModel, prompt: testPrompt }) });
+      const d = await api("/api/admin/models/test", { method: "POST", body: JSON.stringify({ model: testModel, prompt: testPrompt, account_id: testAccountId || undefined }) });
       setTestResult({ status: "ok", latencyMs: d.latency_ms ?? Math.round(performance.now() - started), reply: d.reply ?? "" });
     } catch (e: any) {
       setTestResult({ status: "fail", error: String(e?.message ?? e) });
@@ -169,6 +171,18 @@ export function AccountsPage({ push }: { push: Push }) {
     }
   };
 
+  const bindProxy = async (a: Account) => {
+    const input = window.prompt(t("Bound proxy URL (leave empty for direct)"), a.boundProxy ?? "");
+    if (input === null) return;
+    try {
+      await api("/api/accounts/bind-proxy", { method: "POST", body: JSON.stringify({ id: a.id, proxyUrl: input.trim() }) });
+      push(t("Proxy updated"), "success");
+      await load();
+    } catch (e: any) {
+      push(String(e?.message ?? e), "error");
+    }
+  };
+
   const msgClass = authMsg?.kind === "success" ? "highlight-box success" : authMsg?.kind === "error" ? "highlight-box warning" : "highlight-box";
 
   return (
@@ -258,14 +272,15 @@ export function AccountsPage({ push }: { push: Push }) {
                 <th>{t("Status")}</th>
                 <th>{t("Updated")}</th>
                 <th>{t("Scheduling")}</th>
+                <th>{t("Proxy")}</th>
                 <th>{t("Actions")}</th>
               </tr>
             </thead>
             <tbody>
               {loading ? (
-                <tr><td colSpan={7} className="empty">{t("Loading")}</td></tr>
+                <tr><td colSpan={8} className="empty">{t("Loading")}</td></tr>
               ) : visible.length === 0 ? (
-                <tr><td colSpan={7} className="empty">{t("No matching accounts")}</td></tr>
+                <tr><td colSpan={8} className="empty">{t("No matching accounts")}</td></tr>
               ) : (
                 visible.map((a) => {
                   const statusKey = a.status === "online" ? "Online" : a.status === "cooldown" ? "Cooldown" : "Offline";
@@ -300,6 +315,12 @@ export function AccountsPage({ push }: { push: Push }) {
                           {a.scheduleEnabled ? t("Enabled") : t("Disabled")}
                         </button>
                       </td>
+                      <td style={{ fontSize: 11, color: "var(--muted)", maxWidth: 180, overflowWrap: "anywhere" }}>
+                        {a.boundProxy ? <span className="status online"><span className="dot" />{a.boundProxy}</span> : t("Direct")}
+                        <div style={{ marginTop: 4 }}>
+                          <button className="btn btn-sm" onClick={() => bindProxy(a)}>{t("Bind")}</button>
+                        </div>
+                      </td>
                       <td>
                         <button className="btn btn-sm danger" onClick={() => remove(a.id)}>{t("Delete")}</button>
                       </td>
@@ -319,6 +340,15 @@ export function AccountsPage({ push }: { push: Push }) {
               <label className="form-label">{t("Model")}</label>
               <select className="form-input" value={testModel} onChange={(e) => setTestModel(e.target.value)}>
                 {testModels.map((m) => (<option key={m} value={m}>{m}</option>))}
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">{t("Account")}</label>
+              <select className="form-input" value={testAccountId} onChange={(e) => setTestAccountId(e.target.value)}>
+                <option value="">{t("Auto (default)")}</option>
+                {accounts.map((a: any) => (
+                  <option key={a.id} value={a.id}>{a.displayName || a.email || a.id}</option>
+                ))}
               </select>
             </div>
             <div className="form-group">

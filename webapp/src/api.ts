@@ -18,11 +18,12 @@ export async function api(path: string, opts: { method?: string; body?: string }
   return data;
 }
 
-export async function login(password: string): Promise<{ must_change_password?: boolean }> {
+export async function login(password: string, remember = false): Promise<{ must_change_password?: boolean }> {
   const res = await fetch("/api/admin/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
+    // remember=true 时后端把会话与 cookie 延长到 30 天（见 adminLogin）
+    body: JSON.stringify({ password, remember }),
     credentials: "same-origin",
   });
   const data = await res.json().catch(() => ({}));

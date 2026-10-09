@@ -177,7 +177,7 @@ function LoginScreen({
             setBusy(true);
             try {
               setRememberPref(remember);
-              await login(pwd);
+              await login(pwd, remember);
               onSuccess();
               push(t("Login successful"), "success");
             } catch (err: any) {
