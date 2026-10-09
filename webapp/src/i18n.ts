@@ -202,6 +202,7 @@ const dict: Record<string, Partial<Record<Locale, string>>> = {
   "Test models": { "zh-CN": "测试模型", "zh-TW": "測試模型", ja: "モデルをテスト", ko: "모델 테스트", es: "Probar modelos", fr: "Tester les modèles", de: "Modelle testen", "pt-BR": "Testar modelos", ru: "Тестировать модели", ar: "اختبار النماذج" },
   "Send a minimal request to verify a model": { "zh-CN": "发送一个最小请求以验证模型可用", "zh-TW": "發送一個最小請求以驗證模型可用", ja: "最小リクエストを送信してモデルを確認", ko: "최소 요청을 보내 모델을 확인합니다", es: "Envía una solicitud mínima para verificar el modelo", fr: "Envoyez une requête minimale pour vérifier le modèle", de: "Eine minimale Anfrage senden, um das Modell zu prüfen", "pt-BR": "Envie uma solicitação mínima para verificar o modelo", ru: "Отправьте минимальный запрос для проверки модели", ar: "أرسل طلبًا بسيطًا للتحقق من النموذج" },
   Prompt: { "zh-CN": "提示词", "zh-TW": "提示詞", ja: "プロンプト", ko: "프롬프트", es: "Prompt", fr: "Prompt", de: "Prompt", "pt-BR": "Prompt", ru: "Промпт", ar: "المطالبة" },
+  "Auto (default)": { "zh-CN": "自动（默认）", "zh-TW": "自動（預設）", ja: "自動（既定）", ko: "자동(기본)", es: "Automático (predeterminado)", fr: "Automatique (par défaut)", de: "Automatisch (Standard)", "pt-BR": "Automático (padrão)", ru: "Автоматически (по умолчанию)", ar: "تلقائي (افتراضي)" },
   Test: { "zh-CN": "测试", "zh-TW": "測試", ja: "テスト", ko: "테스트", es: "Probar", fr: "Tester", de: "Testen", "pt-BR": "Testar", ru: "Тест", ar: "اختبار" },
   Close: { "zh-CN": "关闭", "zh-TW": "關閉", ja: "閉じる", ko: "닫기", es: "Cerrar", fr: "Fermer", de: "Schließen", "pt-BR": "Fechar", ru: "Закрыть", ar: "إغلاق" },
 
